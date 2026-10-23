@@ -1,0 +1,94 @@
+---
+title: "Commitment: how the leader advances the commit index"
+sidebarTitle: "Commitment"
+description: "The commitment tracker, quorum calculation, the current-term rule, and how commits reach the FSM in hashicorp/raft."
+---
+
+Source: `commitment.go`, with call sites in `raft.go` and `replication.go`.
+
+## The commitment struct
+
+A new `commitment` is created each time a server becomes leader (`setupLeaderState`). It holds:
+
+| Field | Meaning |
+| --- | --- |
+| `matchIndexes` | `ServerID → highest index known stored`, **voters only** |
+| `commitIndex` | Highest index stored by a quorum. Only increases. Starts at 0. |
+| `startIndex` | First index of this leader's term: `getLastIndex() + 1` at election |
+| `commitCh` | Notified when `commitIndex` increases (buffer size 1) |
+
+All fields are protected by an embedded mutex, so replication goroutines and the main goroutine can call it concurrently.
+
+## Reporting progress: `match`
+
+`match(server, matchIndex)` is called when a server's log is known to agree with the leader's up through `matchIndex`:
+
+- **Leader itself**: `dispatchLogs` calls `match(localID, lastIndex)` after `StoreLogs` succeeds.
+- **Follower, AppendEntries**: `updateLastAppended` calls `match(peer, lastEntry.Index)` after a successful response, **only if the request carried entries**.
+- **Follower, snapshot**: `sendLatestSnapshot` calls `match(peer, meta.Index)` after a successful InstallSnapshot.
+
+`match` ignores the call when the server is not a voter in the current tracker configuration, or when `matchIndex` is not greater than the stored value. Match indexes never decrease.
+
+## Computing the quorum index: `recalculate`
+
+```go
+sort ascending(matched)
+quorumMatchIndex := matched[(len(matched)-1)/2]
+if quorumMatchIndex > commitIndex && quorumMatchIndex >= startIndex {
+    commitIndex = quorumMatchIndex
+    asyncNotifyCh(commitCh)
+}
+```
+
+Index `(n-1)/2` of the ascending list is the largest value that at least `n - (n-1)/2` voters have reached, which is a majority:
+
+| Voters | Sorted match indexes | Picked | Voters at or above |
+| --- | --- | --- | --- |
+| 1 | `[12]` | 12 | 1 of 1 |
+| 3 | `[7, 10, 12]` | 10 | 2 of 3 |
+| 4 | `[5, 7, 10, 12]` | 7 | 3 of 4 |
+| 5 | `[3, 5, 7, 10, 12]` | 7 | 3 of 5 |
+
+With zero voters, `recalculate` returns without change.
+
+## The current-term rule
+
+The commit index cannot move until the quorum index reaches `startIndex`. This is Raft's rule that a leader only commits entries from its own term by counting replicas; earlier-term entries become committed implicitly. The tracker does **not** look at entry terms. It relies entirely on `startIndex` being the first index of the current term.
+
+To make progress without client traffic, `runLeader` immediately dispatches a `LogNoop` entry, which lands exactly at `startIndex`.
+
+**Example.** A new leader's log ends at 100, so `startIndex = 101`. All three voters already store index 100. The quorum index is 100, but `100 < 101`, so nothing is committed. Once the no-op at 101 reaches two voters, `commitIndex` jumps to 101, implicitly committing 1–100 from earlier terms.
+
+## Configuration changes: `setConfiguration`
+
+When the leader appends a configuration entry (`appendConfigurationEntry`), it calls `setConfiguration(newConfig)`:
+
+- Rebuilds `matchIndexes` from the new configuration's voters.
+- Carries over existing match indexes for voters that remain; new voters start at 0.
+- Calls `recalculate`.
+
+Consequences:
+
+- The new configuration governs commitment **as soon as it is appended**, not when it commits.
+- Removing or demoting a lagging voter can advance the commit index immediately.
+- Adding a voter whose match index is 0 can stall commitment until it catches up, if the remaining voters are not enough for a majority of the larger set.
+- `commitIndex` never moves backward, even if the new quorum index is lower.
+
+## From commit index to FSM
+
+When `commitCh` fires, `leaderLoop`:
+
+1. Reads `commitment.getCommitIndex()` and calls `setCommitIndex`.
+2. If the latest configuration's index falls in `(oldCommitIndex, commitIndex]`, marks it committed. If the committed configuration does not give the leader a vote, sets `stepDown`.
+3. Collects in-flight futures with index `<= commitIndex` and calls `processLogs`, which sends batches of up to `MaxAppendEntries` to the FSM goroutine. `LogCommand` and `LogBarrier` go to the FSM; `LogConfiguration` goes to the FSM only when protocol version is above 2; no-ops and deprecated peer entries only resolve their future.
+4. If `stepDown`: shut down when `ShutdownOnRemove` is true, otherwise become a follower. While `stepDown` is set, new `Apply` requests get `ErrNotLeader`.
+
+Because `commitCh` has a one-slot buffer and is notified with a non-blocking send, several advances can collapse into one wakeup. The leader always reads the latest value, so no commit is lost.
+
+## What commitment does not do
+
+- It does not track non-voters. Their progress has no effect on commit.
+- It does not persist the commit index. With `RestoreCommittedLogs` and a `CommitTrackingLogStore`, `dispatchLogs` stages the **previous** commit index alongside new entries (`tryStageCommitIndex`); errors are logged and ignored.
+- It does not tell followers about the commit index. Followers learn it from `LeaderCommitIndex` in replication requests (see [Log replication](/raft/replication)).
+- It is not reused across terms. A new tracker is created per leadership, and all in-flight futures get `ErrLeadershipLost` on step-down.
+- If the leader's own `StoreLogs` fails, `dispatchLogs` responds with the error to those futures and the leader becomes a follower; the leader never reports a match for those entries.

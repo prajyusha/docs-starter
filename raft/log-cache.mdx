@@ -1,0 +1,69 @@
+---
+title: "Log cache"
+sidebarTitle: "Log cache"
+description: "The LogCache ring buffer that wraps a LogStore in hashicorp/raft: lookup rules, invalidation, and caveats."
+---
+
+Source: `log_cache.go`.
+
+`LogCache` wraps any `LogStore` with a fixed-size in-memory ring of recently **written** entries, so reads of recent entries (common in replication) skip disk.
+
+## Construction
+
+```go
+cache, err := raft.NewLogCache(512, store)
+```
+
+- `capacity <= 0` returns `capacity must be positive`.
+- There is no upper bound. The slice of `capacity` pointers is allocated up front; entry memory is held as long as a slot references it.
+- `store` is not checked for `nil`.
+
+## Slot mapping and lookup
+
+Entry `i` lives in slot `i % capacity`. With capacity 512, indexes 5, 517, and 1029 share a slot, and each write replaces the previous occupant.
+
+`GetLog(idx, log)`:
+
+1. Read the slot under a read lock.
+2. If it is non-nil and its `Index == idx`, copy it into `*log` and return.
+3. Otherwise forward to the store.
+
+A miss does **not** fill the cache. Only writes populate it. The hit check compares `Index` only, not `Term`; correctness after truncation relies on `DeleteRange` clearing the cache.
+
+The copy is shallow (`*log = *cached`). Slices such as `Data` are shared with the cached entry. Mutating `log.Data` after `GetLog` mutates the cache.
+
+## Writes
+
+`StoreLog(l)` calls `StoreLogs([]*Log{l})`.
+
+`StoreLogs(logs)`:
+
+1. Calls `store.StoreLogs(logs)`.
+2. On error, returns `unable to store logs within log store, err: "..."`. The cache is not touched.
+3. On success, stores each **pointer** into its slot under the write lock.
+
+Caveats:
+
+- The error is formatted with `%q`, not `%w`, so `errors.Is` and `errors.As` cannot see the underlying store error.
+- Cached entries are the caller's pointers. Mutating a `Log` after storing it changes what later `GetLog` hits return.
+- If the store partially wrote the batch before failing, none of it is cached. Whether stores can partially succeed is implementation-specific (**unknown**).
+- Within one batch, if two entries map to the same slot (batch longer than capacity), the later one wins.
+
+## Deletes
+
+`DeleteRange(min, max)` replaces the whole ring with an empty one, **then** calls `store.DeleteRange`.
+
+- Every delete clears the entire cache, regardless of range. Compaction (deleting old entries) therefore also evicts recent entries, and the cache is cold until new writes arrive.
+- If the store delete fails, the cache stays empty. That is safe, just slower.
+- No lock is held across "clear" and "store delete". A concurrent `StoreLogs` in between repopulates slots; the cache does not guarantee atomicity with the store.
+
+## Pass-throughs
+
+- `FirstIndex` and `LastIndex` go straight to the store.
+- `IsMonotonic()` returns the wrapped store's value if it implements `MonotonicLogStore`, else `false`. This keeps `restoreUserSnapshot`'s old-log removal working through the cache.
+
+## What LogCache does not do
+
+- It does not implement `StageCommitIndex`. `tryStageCommitIndex` type-asserts `r.logs` to `CommitTrackingLogStore`, so if you wrap a commit-tracking store in `LogCache`, commit-index staging is skipped. Whether `NewRaft` rejects that combination with `ErrIncompatibleLogStore` when `RestoreCommittedLogs` is set depends on `api.go` (**unknown**).
+- It does not detect changes made directly to the underlying store. Route every write through the cache.
+- It does not evict by age or size, expose metrics, or bound memory beyond the slot count.

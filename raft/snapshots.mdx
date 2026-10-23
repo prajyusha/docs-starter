@@ -1,0 +1,95 @@
+---
+title: "Snapshots and log compaction"
+sidebarTitle: "Snapshots and compaction"
+description: "When hashicorp/raft takes snapshots, how it decides which logs to delete, user restores, and failure behavior."
+---
+
+Source: `snapshot.go`, with `restoreUserSnapshot` in `raft.go`.
+
+## Interfaces
+
+**`SnapshotStore`**
+
+| Method | Contract from the comments |
+| --- | --- |
+| `Create(version, index, term, configuration, configurationIndex, trans)` | Begin a snapshot; returns a `SnapshotSink` |
+| `List()` | Available snapshots, **newest (highest index) first**. Replication sends `List()[0]`, so ordering bugs send the wrong snapshot. |
+| `Open(id)` | Returns metadata and a `ReadCloser`. After `Close`, the snapshot is assumed no longer needed. |
+
+**`SnapshotSink`**: an `io.WriteCloser` plus `ID()` and `Cancel()`. The FSM writes state and Raft calls `Close`; on error, `Cancel`.
+
+**`SnapshotMeta`**: `Version`, `ID`, `Index`, `Term`, legacy `Peers`, `Configuration`, `ConfigurationIndex`, `Size`. `Version` covers the metadata only; application data must be versioned separately.
+
+Retention, deletion of old snapshots, and durability are up to the store implementation (**unknown**; none supplied).
+
+## When snapshots run
+
+`runSnapshots` runs in its own goroutine:
+
+- **Periodic**: every `randomTimeout(SnapshotInterval)` (default 120–240 s), if `shouldSnapshot()` is true, call `takeSnapshot`. `ErrNothingNewToSnapshot` is not logged; other errors are logged and dropped. There is no retry beyond the next tick.
+- **User-requested** (`userSnapshotCh`): runs immediately. On success, the future gets an opener for the new snapshot. All errors, including `ErrNothingNewToSnapshot`, are returned to the caller.
+
+`shouldSnapshot` returns `lastLogIndex - lastSnapshotIndex >= SnapshotThreshold`, with `lastLogIndex` read from the log store. If `LastIndex()` errors, it returns false.
+
+<Note>
+  The subtraction is unsigned and unguarded. If the store's last index is below the last snapshot index, which can happen right after a user restore burns an index (below), the result wraps to a very large number and the check returns true. With `SnapshotThreshold = 0` (accepted by validation), the check is always true and every tick asks the FSM for a snapshot.
+</Note>
+
+## takeSnapshot
+
+1. Send a `reqSnapshotFuture` to the FSM goroutine and wait. How the FSM picks the snapshot index and term, and when it returns `ErrNothingNewToSnapshot`, is in `fsm.go` (**unknown**).
+2. Ask the main goroutine for the configurations. On a leader with a leadership transfer in progress, this returns `ErrLeadershipTransferInProgress`, so **snapshots fail during leadership transfer**.
+3. If the snapshot index is below `committedIndex`, fail with `cannot take snapshot now, wait until the configuration entry at X has been applied`. A snapshot must cover the latest committed configuration, because only two configurations are tracked.
+4. `Create` a sink with version 1 and the **committed** configuration (never the uncommitted `latest`).
+5. `Persist` FSM state into the sink. On error, `Cancel` the sink and fail.
+6. `Close` the sink. On error, fail (no `Cancel`).
+7. `setLastSnapshot(index, term)`.
+8. `compactLogs(index)`.
+9. `Release` the FSM snapshot (deferred, runs on every path after step 1 succeeds).
+
+If compaction fails, the snapshot is already durable and recorded, but `takeSnapshot` returns an error. A user-requested snapshot then reports failure and gets no opener even though the snapshot exists.
+
+## Compaction rules
+
+`compactLogsWithTrailing(snapIdx, lastLogIdx, trailingLogs)`:
+
+1. `minLog = logs.FirstIndex()`.
+2. If `lastLogIdx <= trailingLogs`, delete nothing.
+3. `maxLog = min(snapIdx, lastLogIdx - trailingLogs)`.
+4. If `minLog > maxLog`, delete nothing.
+5. `logs.DeleteRange(minLog, maxLog)`.
+
+Logs after the snapshot are never deleted, and at least `trailingLogs` entries are kept. `compactLogs` takes `lastLogIdx` from Raft's in-memory last log and reads `TrailingLogs` once.
+
+| Snapshot index | Last log | Trailing | Deleted (first index 1) |
+| --- | --- | --- | --- |
+| 20000 | 25000 | 10240 | 1–14760 (keeps 10240) |
+| 5000 | 25000 | 10240 | 1–5000 |
+| 9000 | 9000 | 10240 | none (`9000 <= 10240`) |
+| 20000 | 25000 | 0 | 1–20000 |
+
+Whether `DeleteRange` treats `maxLog` as inclusive is part of the `LogStore` contract in `log.go` (not supplied); the call passes both ends as the range.
+
+### Tuning trade-off
+
+Entries removed by compaction cannot be sent to followers. A follower whose `nextIndex` falls below the first retained entry hits `ErrLogNotFound` and receives a full snapshot (see [Log replication](/raft/replication#snapshot-fallback)). Larger `TrailingLogs` costs disk but avoids snapshot transfers for briefly lagging followers.
+
+## User restore
+
+`restoreUserSnapshot(meta, reader)` runs on the leader's main goroutine:
+
+1. Reject a snapshot version outside 0–1.
+2. Reject if a configuration change is uncommitted.
+3. Fail every in-flight log future with `ErrAbortedByRestore`.
+4. Pick `index = max(meta.Index, lastIndex) + 1` and the current term. This deliberately leaves a hole in the log, so followers fault into a snapshot install.
+5. `Create` a sink using the cluster's **current** `latest` configuration, not the snapshot's. Copy the reader; if the byte count differs from `meta.Size`, `Cancel` and fail.
+6. Restore into the FSM. If that fails, Raft **panics**.
+7. Set last log, last applied, and last snapshot to the new index.
+8. If the log store is a `MonotonicLogStore` reporting true, delete all existing logs (`removeOldLogs`); errors are logged only.
+
+A leadership transfer in progress rejects the restore with `ErrLeadershipTransferInProgress`. Followers and candidates return `ErrNotLeader`.
+
+## Other notes
+
+- `NoSnapshotRestoreOnStart` skips restoring the FSM from a snapshot at start; metadata is still used for configuration and indexes (field comment; implementation in `api.go`, unknown).
+- Snapshot version 0 metadata uses the legacy `Peers` format; version 1 includes `Configuration` and also fills `Peers` for upgrades.

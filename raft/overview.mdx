@@ -1,0 +1,64 @@
+---
+title: "hashicorp/raft internals: overview"
+sidebarTitle: "Overview"
+description: "Scope, source provenance, and known gaps for the hashicorp/raft internals reference."
+---
+
+This section documents selected internals of the `hashicorp/raft` Go library for engineers who operate or modify it. Each page states what a function does, what it does **not** do, and which file the claim comes from.
+
+## Source provenance
+
+No source bundle was attached, so the files were fetched from the `main` branch of `github.com/hashicorp/raft` on October 23, 2026. **The exact commit is unknown.** Verify line-level details against the version you run.
+
+| File | Coverage |
+| --- | --- |
+| `commitment.go` | Read in full |
+| `configuration.go` | Read in full |
+| `config.go` | Read in full |
+| `snapshot.go` | Read in full |
+| `replication.go` | Read in full |
+| `log_cache.go` | Read in full |
+| `util.go` | Read in full (timeouts, backoff helpers) |
+| `raft.go` | Read up to the middle of the follower `appendEntries` handler. The remainder was truncated and is **unknown**. |
+
+## Not supplied (treated as unknown)
+
+- `api.go`: `NewRaft`, `AddVoter`/`RemoveServer` wrappers, `ReloadConfig`, `BootstrapCluster`, channel buffer sizes.
+- `fsm.go`: how the FSM goroutine applies batches, takes snapshots (`fsmSnapshotCh`), and calls `ConfigurationStore.StoreConfiguration`.
+- `log.go`, `future.go`, `observer.go`, `transport.go`: `LogStore` contract details (for example, whether `DeleteRange` is inclusive), future semantics.
+- Every `LogStore`, `SnapshotStore`, and `Transport` implementation.
+- The truncated part of `raft.go`, including `processConfigurationLogEntry`, `setLatestConfiguration`, `setCommittedConfiguration`, and the `installSnapshot` RPC handler.
+
+Where behavior depends on these, the pages say **unknown**.
+
+## Pages
+
+<CardGroup cols={2}>
+  <Card title="Configuration" href="/raft/configuration">
+    Defaults, validation, reloadable fields, timer randomization.
+  </Card>
+
+  <Card title="Commitment" href="/raft/commitment">
+    How the leader computes the commit index.
+  </Card>
+
+  <Card title="Membership changes" href="/raft/membership">
+    Single-change configuration rules and leader gating.
+  </Card>
+
+  <Card title="Log replication" href="/raft/replication">
+    Per-follower replication, pipelining, heartbeats, backoff.
+  </Card>
+
+  <Card title="Snapshots and compaction" href="/raft/snapshots">
+    When snapshots run and which logs are deleted.
+  </Card>
+
+  <Card title="Log cache" href="/raft/log-cache">
+    The in-memory ring buffer in front of a LogStore.
+  </Card>
+</CardGroup>
+
+## Threading model in brief
+
+Most state is owned by the **main goroutine** (`run` → `runFollower`/`runCandidate`/`runLeader` in `raft.go`). Other goroutines reach it through channels: `configurationChangeCh`, `configurationsCh`, `applyCh`, `verifyCh`, `userRestoreCh`. The leader runs one `replicate` goroutine plus one `heartbeat` goroutine per peer (`replication.go`), and a separate `runSnapshots` goroutine takes snapshots (`snapshot.go`). Functions marked "must only be called from the main thread" in the source must stay that way if you change them.

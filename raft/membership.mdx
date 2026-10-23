@@ -1,0 +1,133 @@
+---
+title: "Cluster membership changes"
+sidebarTitle: "Membership changes"
+description: "Server suffrage, configuration change commands, validation, and how the leader serializes membership changes in hashicorp/raft."
+---
+
+Source: `configuration.go`, with leader logic in `raft.go`.
+
+## Data model
+
+A `Configuration` is a list of `Server{Suffrage, ID, Address}`. The comment says each server should appear once, in no particular order, and the local server should be included if it is a member.
+
+| Suffrage | Value | Votes | Counts toward commit |
+| --- | --- | --- | --- |
+| `Voter` | 0 | Yes | Yes |
+| `Nonvoter` | 1 | No | No |
+| `Staging` (deprecated) | 2 | No | No; acts like `Nonvoter` |
+
+<Warning>
+  The numeric values are written into the log. Do not renumber `ServerSuffrage` or `ConfigurationChangeCommand`.
+</Warning>
+
+Every server tracks two configurations in `configurations`: `committed`/`committedIndex` and `latest`/`latestIndex`. Following Ongaro's dissertation, **at most one configuration may be uncommitted** at a time, so `latest` is either equal to `committed` or one change ahead.
+
+## Change commands
+
+`nextConfiguration(current, currentIndex, change)` produces the next configuration. It clones `current` and applies one command:
+
+| Command | Server absent | Server present as Voter | Present as Nonvoter | Present as Staging |
+| --- | --- | --- | --- | --- |
+| `AddVoter` (0) | Appended as Voter | Address updated | Becomes Voter, address updated | Becomes Voter, address updated |
+| `AddNonvoter` (1) | Appended as Nonvoter | **Address updated, stays Voter** | Address updated | **Address updated, stays Staging** |
+| `DemoteVoter` (2) | No change | Becomes Nonvoter | No change | Becomes Nonvoter |
+| `RemoveServer` (3) | No change | Removed | Removed | Removed |
+| `Promote` (4, deprecated) | No change | No change | No change | Becomes Voter |
+
+`AddStaging` is an alias for `0`, so it is `AddVoter`.
+
+Matching is by `ID` only. `RemoveServer` and `DemoteVoter` ignore the address.
+
+### Optimistic concurrency: `prevIndex`
+
+If `change.prevIndex > 0` and it differs from `currentIndex` (the leader's `latestIndex`), the change fails with `configuration changed since X (latest is Y)`. A `prevIndex` of 0 applies unconditionally.
+
+### Validation: `checkConfiguration`
+
+After applying the command, the result must pass:
+
+- No server with an empty `ID`.
+- No server with an empty `Address`.
+- No duplicate `ID`.
+- No duplicate `Address`.
+- At least one `Voter`.
+
+So `AddVoter` with an empty address fails, demoting or removing the last voter fails, and changing a server's address to one already in use fails.
+
+It does **not** check that addresses are reachable or well formed, that the leader remains in the configuration, or that the cluster keeps an odd number of voters.
+
+<Note>
+  A command that changes nothing (removing an absent server, demoting an absent server, promoting a non-Staging server) still passes validation, and `appendConfigurationEntry` still appends a new configuration entry. It consumes a log index and must commit before the next change.
+</Note>
+
+## Leader flow
+
+### 1. Enqueue
+
+`requestConfigChange(req, timeout)` sends a `configurationChangeFuture` on `configurationChangeCh`. The `timeout` bounds only the enqueue: it returns `ErrEnqueueTimeout` if the send does not complete in time, or `ErrRaftShutdown` on shutdown. It does not bound how long the change takes to commit. The channel's buffer size is defined in `api.go` (unknown).
+
+Followers and candidates answer every change request with `ErrNotLeader`.
+
+### 2. Gate
+
+The leader only reads from the channel when `configurationChangeChIfStable()` returns it, which requires both:
+
+- `latestIndex == committedIndex` (no uncommitted configuration), and
+- `commitIndex >= commitment.startIndex` (this leader has committed an entry in its term, normally the no-op).
+
+Otherwise the request waits in the channel; it is **not** rejected. If a leadership transfer is in progress when it is read, it gets `ErrLeadershipTransferInProgress`.
+
+### 3. Append
+
+`appendConfigurationEntry`:
+
+1. Calls `nextConfiguration(latest, latestIndex, req)`; on error, responds and stops.
+2. Encodes the entry:
+   - Protocol version `< 2`: `LogRemovePeerDeprecated` with `encodePeers`, which includes **voters only**. Non-voters cannot be represented and are dropped from the encoded entry.
+   - Otherwise: `LogConfiguration` with `EncodeConfiguration` (MsgPack).
+3. `dispatchLogs` writes it locally and triggers replication.
+4. `setLatestConfiguration(configuration, index)`.
+5. `commitment.setConfiguration(configuration)`: the new voter set governs commit immediately (see [Commitment](/raft/commitment)).
+6. `startStopReplication()`.
+
+### 4. Start and stop replication
+
+`startStopReplication` compares `latest` against running replicators:
+
+- **New servers** (voters and non-voters, excluding self) get a replicator with `nextIndex = lastIndex + 1`, and an immediate trigger.
+- **Existing servers with a new address** have their `peer` updated in place under `peerLock`.
+- **Removed servers** receive `lastIndex` on `stopCh`, then the channel is closed. The replicator makes a best effort to replicate up to that index. In practice, see [Log replication](/raft/replication#stopping): it sends at most one batch before exiting.
+
+### 5. Commit
+
+When the commit index passes `latestIndex`, `leaderLoop` marks it committed. If the leader is no longer a voter in the committed configuration, it steps down (or shuts down with `ShutdownOnRemove`). New applies are refused with `ErrNotLeader` from that point.
+
+## Follower behavior
+
+- **Elections.** On heartbeat timeout, a follower does not start an election if `latestIndex == 0` ("no known peers"), or if it is not a voter in `latest`. Non-voters therefore never campaign.
+- **Truncation.** If a follower deletes a conflicting log suffix that covers `latestIndex`, it reverts `latest` to `committed`.
+- **New entries.** Each appended entry goes through `processConfigurationLogEntry`. Its body is in the truncated part of `raft.go` and is **unknown**.
+- **Bootstrap.** `liveBootstrap` rejects a configuration in which the local server is not a voter (`ErrNotVoter`). Candidates and leaders answer bootstrap with `ErrCantBootstrap`.
+
+## Encoding helpers
+
+| Function | Behavior |
+| --- | --- |
+| `EncodeConfiguration` / `DecodeConfiguration` | MsgPack. **Panic** on error. |
+| `encodePeers` | Legacy format; voters only. Panics on encode error. |
+| `decodePeers` | Returns an error on bad input. Every peer becomes a `Voter` with `ID == Address`. |
+| `Configuration.Clone` | Copies the slice. `Server` has only value fields, so the copy is independent. |
+
+## ConfigurationStore
+
+An FSM can implement `ConfigurationStore` to receive `StoreConfiguration(index, configuration)` when a configuration entry commits. The supplied `prepareLog` forwards `LogConfiguration` entries to the FSM goroutine only when protocol version is above 2. How the FSM goroutine routes them to `StoreConfiguration` is in `fsm.go` (**unknown**).
+
+## Example: replacing a voter safely
+
+In a three-voter cluster `{a, b, c}`, to replace `c` with `d`:
+
+1. `AddNonvoter(d)`. Commitment is unaffected while `d` catches up.
+2. Once `d` is current, `AddVoter(d)`. The voter set becomes four; quorum is 3.
+3. `RemoveServer(c)`. Back to three voters.
+
+Each step waits for the previous configuration to commit (the gate in step 2 of the leader flow). Pass `prevIndex` from the previous step's index to fail fast if someone else changed membership in between. Whether the public API exposes catch-up progress is in `api.go` (unknown).

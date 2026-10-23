@@ -16,6 +16,18 @@
           "index",
           "quickstart"
         ]
+      },
+      {
+        "group": "hashicorp/raft internals",
+        "pages": [
+          "raft/overview",
+          "raft/configuration",
+          "raft/commitment",
+          "raft/membership",
+          "raft/replication",
+          "raft/snapshots",
+          "raft/log-cache"
+        ]
       }
     ],
     "global": {

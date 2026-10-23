@@ -1,0 +1,97 @@
+---
+title: "Configuration defaults and validation"
+sidebarTitle: "Configuration"
+description: "Config defaults, ValidateConfig rules, reloadable fields, and how timeouts are randomized in hashicorp/raft."
+---
+
+Source: `config.go`, `util.go`, and call sites in `raft.go`, `replication.go`, `snapshot.go`.
+
+## Defaults
+
+`DefaultConfig()` returns:
+
+| Field | Default | Used for |
+| --- | --- | --- |
+| `ProtocolVersion` | `3` (`ProtocolVersionMax`) | Wire and log-entry format spoken to peers |
+| `HeartbeatTimeout` | 1000 ms | Follower election trigger; heartbeat interval is derived from it |
+| `ElectionTimeout` | 1000 ms | Candidate retry interval |
+| `CommitTimeout` | 50 ms | Idle replication tick that propagates the commit index |
+| `MaxAppendEntries` | 64 | Max entries per AppendEntries, group-commit batch, FSM batch |
+| `ShutdownOnRemove` | `true` | Shut down after the leader removes itself |
+| `TrailingLogs` | 10240 | Logs kept after compaction |
+| `SnapshotInterval` | 120 s | Snapshot check period |
+| `SnapshotThreshold` | 8192 | Minimum new log entries before a snapshot |
+| `LeaderLeaseTimeout` | 500 ms | Leader step-down if quorum unreachable |
+| `LogLevel` | `"DEBUG"` | hclog level |
+
+Every other field is the Go zero value: `LocalID` empty, `BatchApplyCh`, `NoSnapshotRestoreOnStart`, `PreVoteDisabled`, `NoLegacyTelemetry`, `RestoreCommittedLogs` all `false`, `NotifyCh`, `Logger`, and `LogOutput` all `nil`.
+
+<Warning>
+  `DefaultConfig()` does not pass `ValidateConfig` as returned, because `LocalID` is empty. You must set it.
+</Warning>
+
+## ValidateConfig rules
+
+`ValidateConfig(config)` returns the first error found, in this order:
+
+| Check | Error condition |
+| --- | --- |
+| Protocol version | `< 1` or `> 3`. Version 0 is understood on the wire but cannot be configured: the minimum is raised from 0 to 1. |
+| `LocalID` | empty |
+| `HeartbeatTimeout` | `< 5ms` |
+| `ElectionTimeout` | `< 5ms` |
+| `CommitTimeout` | `< 1ms` |
+| `MaxAppendEntries` | `<= 0` or `> 1024` |
+| `SnapshotInterval` | `< 5ms` |
+| `LeaderLeaseTimeout` | `< 5ms`, or greater than `HeartbeatTimeout` |
+| `ElectionTimeout` vs heartbeat | `ElectionTimeout < HeartbeatTimeout` |
+
+The defaults sit on two boundaries: `ElectionTimeout == HeartbeatTimeout` (allowed) and `LeaderLeaseTimeout` is half of `HeartbeatTimeout`. Raising `LeaderLeaseTimeout` above `HeartbeatTimeout`, or lowering `ElectionTimeout` below it, fails validation.
+
+### What ValidateConfig does not check
+
+- `TrailingLogs` and `SnapshotThreshold`: any `uint64` is accepted, including `0`.
+- Upper bounds on any timeout.
+- `LocalID` format, or that it matches the transport address. The field comment says that with `ProtocolVersion < 3` it **must** equal the transport address; nothing in `config.go` enforces it.
+- `LogLevel` spelling. Per the field comment, an unknown string becomes `hclog.NoLevel`.
+- `RestoreCommittedLogs` compatibility. The comment says `NewRaft` returns `ErrIncompatibleLogStore` if the store does not implement `CommitTrackingLogStore`; that check lives in `api.go` (not supplied).
+- Whether `NewRaft` or `ReloadConfig` call `ValidateConfig` is **unknown** (`api.go` not supplied).
+
+## Reloadable fields
+
+`ReloadableConfig` covers exactly five fields: `TrailingLogs`, `SnapshotInterval`, `SnapshotThreshold`, `HeartbeatTimeout`, `ElectionTimeout`. `apply` copies them onto a `Config` copy; `fromConfig` copies them out. Neither validates.
+
+Effects observable in the supplied code:
+
+- Most loops re-read `r.config()` per iteration, so new timeouts apply on the next timer.
+- A candidate refreshes its election timer when `followerNotifyCh` fires and `ElectionTimeout` changed (`runCandidate`).
+- New `TrailingLogs` applies at the next compaction (field comment and `compactLogs`).
+- `MaxAppendEntries` is not reloadable, but `setNewLogs` and `processLogs` read it once per call "in case it ever becomes reloadable".
+
+## Timer randomization
+
+`randomTimeout(d)` (`util.go`) returns a channel firing after `d + rand % d`, which is in `[d, 2d)`. If `d == 0` it returns `nil`, and a receive on a nil channel blocks forever, so a zero interval silently disables that timer. Validation prevents zero for the configured fields, but derived values matter:
+
+| Timer | Expression | Default range |
+| --- | --- | --- |
+| Follower heartbeat check | `randomTimeout(HeartbeatTimeout)` | 1–2 s |
+| Candidate election | `randomTimeout(ElectionTimeout)` | 1–2 s |
+| Leader heartbeat send | `randomTimeout(HeartbeatTimeout / 10)` | 100–200 ms |
+| Idle replication tick | `randomTimeout(CommitTimeout)` | 50–100 ms |
+| Snapshot check | `randomTimeout(SnapshotInterval)` | 120–240 s |
+
+`HeartbeatTimeout / 10` uses integer duration division. At the 5 ms minimum it is 500 µs; it only reaches zero below 10 ns, which validation rejects.
+
+## Behavior of other fields
+
+- **`NotifyCh`**: `runLeader` blocks sending `true` on gaining leadership and `false` on losing it (unless shutting down). An unbuffered, unread channel stalls the leader before it starts replication.
+- **`ShutdownOnRemove`**: if the committed configuration no longer gives the leader a vote, the leader calls `Shutdown()` when `true`, or becomes a follower when `false` (`leaderLoop`).
+- **`BatchApplyCh`**: per its comment, buffers `applyCh` to `MaxAppendEntries` and breaks the `Apply` timeout guarantee. Implementation is in `api.go` (unknown).
+- **`LeaderLeaseTimeout`**: `checkLeaderLease` counts voters (self included) whose last contact is within the lease; fewer than `voters/2 + 1` makes the leader step down. The next check runs after `LeaderLeaseTimeout - maxDiff`, floored at 10 ms (`minCheckInterval`).
+- **Logger**: `Logger` wins; otherwise a logger named `raft` writes to `LogOutput`, defaulting to `os.Stderr`. Note `getOrCreateLogger` mutates `conf.LogOutput`.
+
+## Protocol and snapshot versions
+
+- Understood protocol range: 0–3. `checkRPCHeader` rejects RPCs outside that range, and any RPC whose version is below `configured - 1` (`ErrUnsupportedProtocol`).
+- Snapshot versions understood: 0–1. `getSnapshotVersion` always returns `1` regardless of protocol version.
+- The upgrade path (1 → 2 → 3, with remove/re-add to assign IDs) is described in the `ProtocolVersion` comment in `config.go`.

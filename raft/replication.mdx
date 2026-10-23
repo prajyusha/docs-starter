@@ -1,0 +1,118 @@
+---
+title: "Log replication to followers"
+sidebarTitle: "Log replication"
+description: "Per-follower replication, rejection handling, retry backoff, pipelining, heartbeats, and snapshot fallback in hashicorp/raft."
+---
+
+Source: `replication.go`, `util.go`, and the leader and follower handlers in `raft.go`.
+
+## Per-follower state
+
+For every peer in `latest` except itself, the leader runs a `replicate` goroutine and a `heartbeat` goroutine sharing one `followerReplication`:
+
+| Field | Meaning |
+| --- | --- |
+| `currentTerm` | Leader's term, fixed for the replicator's life |
+| `nextIndex` | Next index to send. Starts at `lastIndex + 1` (optimistic). Atomic. |
+| `failures` | Failed RPCs since last success; drives backoff. Replicate goroutine only. |
+| `lastContact` | Time of the last response of any kind; read by the leader lease check |
+| `allowPipeline` | Set after a successful RPC; enables pipeline mode |
+| `stopCh` | Receives a final index and is closed on removal; closed on step-down |
+| `triggerCh` | One-slot channel notified when new entries are written |
+
+## The replicate loop
+
+`replicate` waits on:
+
+- `stopCh`: if the value is `> 0`, calls `replicateTo` once, then returns. A closed channel yields 0, so on step-down it returns immediately.
+- `triggerDeferErrorCh`: replicates to the last index and answers the caller (used by leadership transfer).
+- `triggerCh`: replicates to the last index.
+- `randomTimeout(CommitTimeout)`: replicates to the last index even with no new entries. This is how followers learn a newer commit index when traffic stops; heartbeats do not carry it.
+
+After any successful pass with `allowPipeline` set, it switches to pipeline mode.
+
+## replicateTo, step by step
+
+1. **Backoff.** If `failures > 0`, wait `backoff(10ms, failures, 12)`. The wait ends early on Raft shutdown (but then continues), not on `stopCh`.
+2. **Build request** (`setupAppendEntries`): header, term, leader address, `LeaderCommitIndex = getCommitIndex()`, previous entry, and entries.
+   - Previous entry: `0/0` when `nextIndex == 1`; the last snapshot's index and term when `nextIndex - 1` equals it; otherwise read from the log store.
+   - Entries: `nextIndex` through `min(nextIndex + MaxAppendEntries - 1, lastIndex)`.
+   - If any read returns `ErrLogNotFound`, go to **snapshot fallback**. Any other error returns silently, with no failure counted; the next trigger or `CommitTimeout` tick retries.
+3. **Send.** On transport error, log, increment `failures`, return. There is no immediate retry; the next trigger or tick retries after backoff.
+4. **Stale term.** If `resp.Term > req.Term`, call `handleStaleTerm` (fail pending leader verifications, signal step-down) and stop.
+5. **Record contact**, for success and rejection alike.
+6. **Success.** If the request carried entries, set `nextIndex = last + 1` and report the match to [commitment](/raft/commitment). Reset `failures`, allow pipelining.
+7. **Rejection.** Set `nextIndex = max(min(nextIndex - 1, resp.LastLog + 1), 1)`. If `resp.NoRetryBackoff` reset `failures`, else increment it.
+8. **More?** Poll `stopCh`; if it fires, stop. If `nextIndex <= lastIndex`, loop to step 1.
+
+### Rejection example
+
+The leader's `nextIndex` for a follower is 101, and the follower's log ends at 40. The follower rejects with `LastLog = 40`, so `nextIndex = min(100, 41) = 41`. The next request sends from 41 with previous entry 40, skipping 59 one-step probes.
+
+The follower sets `NoRetryBackoff = true` when it is missing the previous entry or its term differs (`appendEntries` in `raft.go`). Log-matching probes therefore run without delay. Other rejections, such as a failure reading or storing entries on the follower, are backed off.
+
+## Backoff numbers
+
+`backoff(base, round, limit)` doubles `base` once for each step that `min(round, limit)` exceeds 2:
+
+| `failures` | 1–2 | 3 | 4 | 5 | 6 | 8 | 10 | 12+ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Wait | 10 ms | 20 ms | 40 ms | 80 ms | 160 ms | 640 ms | 2.56 s | 10.24 s |
+
+The cap is 10 ms × 2¹⁰ = 10.24 s. There is no jitter.
+
+## Snapshot fallback
+
+`sendLatestSnapshot` runs when the needed log entries are gone (usually compacted):
+
+1. `snapshots.List()`; on error, or with no snapshots (`no snapshots found`), return the error. `failures` is **not** incremented, so the retry happens at the next trigger or tick with no added backoff, logging an error each time.
+2. Open the newest snapshot (`List` must return newest first) and send `InstallSnapshot` with its metadata and encoded configuration.
+3. Transport error: increment `failures`, return error.
+4. Stale term: step down.
+5. Success: `nextIndex = meta.Index + 1`, report a match at `meta.Index`, reset `failures`.
+6. Rejection: increment `failures`.
+
+After a successful install, `replicateTo` continues with the logs after the snapshot.
+
+## Pipeline mode
+
+After a successful round, `pipelineReplicate` opens `trans.AppendEntriesPipeline`. If the transport returns `ErrPipelineReplicationNotSupported`, it falls back without logging.
+
+- **Send side** (`pipelineSend`) builds requests from a local `nextIndex` and advances it optimistically after each send. It does not wait for responses.
+- **Decode side** (`pipelineDecode`) handles responses in order: stale term causes step-down; a rejection ends the pipeline; success updates the shared `nextIndex` and the match index.
+
+Pipeline mode does not:
+
+- back off or count `failures`;
+- decrement `nextIndex` on rejection;
+- send snapshots. Any request-building error, including `ErrLogNotFound`, ends the pipeline.
+
+On any exit, the replicator returns to RPC mode with `allowPipeline = false`, and only re-enters the pipeline after another successful RPC.
+
+## Heartbeats
+
+`heartbeat` runs independently so disk I/O in `replicate` cannot delay it.
+
+- **Interval**: `randomTimeout(HeartbeatTimeout / 10)` (default 100–200 ms), or immediately when `notifyCh` fires (leader verification, `leaderNotifyCh`).
+- **Payload**: header, term, and leader only. No entries, no previous entry, no `LeaderCommitIndex`.
+- **On error**: emits `FailedHeartbeatObservation`, waits `cappedExponentialBackoff(10ms, failures, 12, HeartbeatTimeout/2)`, increments its own counter.
+- **On success**: emits `ResumedHeartbeatObservation` if it had failed, records contact, resets the counter, and resolves pending leader verifications with `resp.Success`.
+
+With defaults the heartbeat backoff is 10, 10, 10, 20, 40, 80, 160, 320 ms, then capped at 500 ms.
+
+<Warning>
+  The heartbeat path does not check `resp.Term`. A higher term seen only by heartbeats does not trigger step-down there; it affects the leader through failed verifications, the lease check, and the replicate path.
+</Warning>
+
+## Stopping
+
+On step-down, `runLeader` closes every `stopCh`. On removal, `startStopReplication` sends the final index and then closes the channel. In `replicateTo`, the `stopCh` poll after the first RPC sees the closed channel and returns. **Best-effort replication to a removed server therefore sends at most one batch** of `MaxAppendEntries` entries; a far-behind server will not receive everything up to the final index.
+
+## Leader lease and verification
+
+- `checkLeaderLease` uses each voter's `lastContact`. Any response counts, including rejections.
+- `verifyLeader` counts the leader as one vote, triggers immediate heartbeats, and answers `nil` once a quorum of heartbeat responses report success. A single-voter cluster answers immediately.
+
+## What the follower does with a request
+
+From the supplied part of `appendEntries`: ignore older terms; adopt newer terms and become follower; record the leader; check the previous entry; skip duplicates; on a term conflict, delete the suffix (`DeleteRange(conflict, lastIndex)`) and revert an uncommitted configuration; store new entries; then set `commitIndex = min(LeaderCommitIndex, lastIndex)`. The rest of the handler is truncated in the fetched file and is **unknown**.
